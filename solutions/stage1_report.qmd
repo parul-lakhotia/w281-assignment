@@ -1,0 +1,380 @@
+---
+title: "Forecasting U.S. Inflation, Stage 1"
+subtitle: "Data, inflation construction, and exploratory analysis, 1960Q1-1999Q4"
+author: "Parul Lakhotia"
+date: today
+format:
+  pdf:
+    toc: true
+    number-sections: true
+    geometry: margin=1in
+    fig-width: 7
+    fig-height: 3.6
+    fig-dpi: 120
+execute:
+  warning: false
+  message: false
+---
+
+```{r setup}
+knitr::opts_chunk$set(echo = TRUE, fig.align = "center")
+library(ggplot2)
+library(dplyr)
+library(readr)
+library(tidyr)
+library(tibble)
+library(patchwork)
+library(scales)
+library(zoo)
+library(changepoint)
+source(file.path("R", "stage1_helpers.R"))
+
+retrieval_date <- Sys.Date()
+stage1_start <- zoo::as.yearqtr("1960 Q1")
+stage1_end <- zoo::as.yearqtr("1999 Q4")
+```
+
+# Purpose
+
+Stage 1 builds the dataset I will use later for forecasting. I download headline CPI, the civilian unemployment rate, and the three-month Treasury bill rate from FRED, turn the monthly files into end-of-quarter series, and construct annualized quarter-over-quarter CPI inflation. All plots and the change-point analysis below use 1960Q1-1999Q4, the initial sample in the project calendar.
+
+# Step 1: Obtain the data
+
+I take three monthly series from FRED: headline CPI (`CPIAUCSL`), the civilian unemployment rate (`UNRATE`), and the three-month Treasury bill secondary-market rate (`TB3MS`). I keep CPI from December 1959 so that 1960Q1 inflation can be computed from an observed previous-quarter price level rather than from a missing lag.
+
+```{r download}
+data_dir <- "data"
+series_meta <- tibble(
+  series_name = c(
+    "Consumer Price Index for All Urban Consumers: All Items",
+    "Unemployment Rate",
+    "3-Month Treasury Bill Secondary Market Rate"
+  ),
+  fred_code = c("CPIAUCSL", "UNRATE", "TB3MS"),
+  original_frequency = "Monthly"
+)
+
+raw_paths <- file.path(data_dir, paste0(series_meta$fred_code, ".csv"))
+names(raw_paths) <- series_meta$fred_code
+
+for (code in series_meta$fred_code) {
+  download_fred_series(code, raw_paths[[code]])
+}
+
+raw <- lapply(series_meta$fred_code, function(code) {
+  read_fred_csv(raw_paths[[code]], code)
+})
+names(raw) <- series_meta$fred_code
+
+appendix_table <- series_meta %>%
+  mutate(
+    retrieval_date = retrieval_date,
+    first_observation = as.Date(sapply(fred_code, function(z) min(raw[[z]]$date, na.rm = TRUE))),
+    last_observation = as.Date(sapply(fred_code, function(z) max(raw[[z]]$date, na.rm = TRUE)))
+  ) %>%
+  select(series_name, fred_code, retrieval_date, first_observation, last_observation, original_frequency)
+```
+
+Appendix Table 1 lists series name, FRED code, retrieval date, first observation, last observation, and original frequency.
+
+```{r appendix-table}
+knitr::kable(
+  appendix_table,
+  caption = "Appendix Table 1. FRED series used in Stage 1.",
+  col.names = c(
+    "Series name", "FRED code", "Retrieval date",
+    "First observation", "Last observation", "Original frequency"
+  ),
+  booktabs = TRUE
+)
+```
+
+# Step 2: Verify data quality
+
+I convert each monthly series to a quarterly series by keeping March, June, September, and December. FRED codes missing values as `.`; those become `NA` when the file is read as numeric. I count duplicate dates in the monthly files and duplicate quarters after the conversion.
+
+```{r quality}
+quality_monthly <- lapply(series_meta$fred_code, function(code) {
+  d <- raw[[code]]
+  tibble(
+    series = code,
+    n_monthly = nrow(d),
+    n_missing_monthly = sum(is.na(d$value)),
+    n_duplicate_dates = sum(duplicated(d$date)),
+    first_monthly = min(d$date, na.rm = TRUE),
+    last_monthly = max(d$date, na.rm = TRUE)
+  )
+}) %>% bind_rows()
+
+quarterly_list <- lapply(series_meta$fred_code, function(code) {
+  raw[[code]] %>%
+    filter(end_of_quarter_months(date)) %>%
+    mutate(qtr = to_quarter(date)) %>%
+    arrange(qtr)
+})
+names(quarterly_list) <- series_meta$fred_code
+
+cpi_all <- quarterly_list$CPIAUCSL %>%
+  filter(qtr >= zoo::as.yearqtr("1959 Q4")) %>%
+  mutate(infl = annualized_qoq_inflation(value))
+
+un_all <- quarterly_list$UNRATE %>% rename(unrate = value)
+tb_all <- quarterly_list$TB3MS %>% rename(tb3ms = value)
+
+q_panel <- cpi_all %>%
+  left_join(un_all %>% select(qtr, unrate), by = "qtr") %>%
+  left_join(tb_all %>% select(qtr, tb3ms), by = "qtr") %>%
+  arrange(qtr)
+
+stage1 <- q_panel %>%
+  filter(qtr >= stage1_start, qtr <= stage1_end)
+
+n_dup_q <- sum(duplicated(stage1$qtr))
+
+quality_quarterly <- tibble(
+  series = c(
+    "CPIAUCSL (end of quarter)",
+    "Inflation (constructed)",
+    "UNRATE (end of quarter)",
+    "TB3MS (end of quarter)"
+  ),
+  n_obs = c(
+    sum(!is.na(stage1$value)),
+    sum(!is.na(stage1$infl)),
+    sum(!is.na(stage1$unrate)),
+    sum(!is.na(stage1$tb3ms))
+  ),
+  n_missing = c(
+    sum(is.na(stage1$value)),
+    sum(is.na(stage1$infl)),
+    sum(is.na(stage1$unrate)),
+    sum(is.na(stage1$tb3ms))
+  ),
+  n_duplicate_quarters = n_dup_q,
+  first_usable_quarter = as.character(min(stage1$qtr)),
+  last_usable_quarter = as.character(max(stage1$qtr))
+)
+
+knitr::kable(
+  quality_monthly,
+  caption = "Monthly download checks before quarterly conversion.",
+  booktabs = TRUE
+)
+
+knitr::kable(
+  quality_quarterly,
+  caption = "Quarterly sample used in Stage 1 (1960Q1-1999Q4).",
+  booktabs = TRUE
+)
+```
+
+**Corrections.** The only change to the downloaded files is reading FRED's `.` missing codes as numeric `NA`. I did not alter any reported values or shift any dates. I did not average months within a quarter; I kept the last month of each quarter, as specified. December 1959 (1959Q4) CPI is used only as the lag for 1960Q1 inflation. It is not an inflation observation in the Stage 1 sample.
+
+The 1960Q1-1999Q4 window has `r nrow(stage1)` quarters. There `r if (n_dup_q == 0) "are no duplicate quarters" else paste("are", n_dup_q, "duplicate quarters")`. Inflation is defined in every Stage 1 quarter because 1959Q4 CPI is present. `r if (any(quality_monthly$n_duplicate_dates > 0)) "The monthly files contain duplicate dates, which would need to be resolved before forecasting." else "The monthly files contain no duplicate dates."`
+
+# Step 3: Construct inflation
+
+Inflation is the rate at which the price level is changing. The project uses seasonally adjusted U.S. headline CPI, so food and energy are included.
+
+Let $P_t$ be end-of-quarter CPI. Annualized quarter-over-quarter inflation is
+
+$$
+\pi_t = 400 \log\left(\frac{P_t}{P_{t-1}}\right).
+$$
+
+The ratio compares this quarter with the previous quarter. Multiplying the log change by 100 puts it in percent. Multiplying by 4 puts the one-quarter change at an annual rate, which is why the factor is 400.
+
+If CPI rises from 100 to 101,
+
+$$
+400 \log(101/100) \approx 3.98.
+$$
+
+Prices rose by about 1% during the quarter. The 3.98 figure states that quarterly rise at an annualized pace.
+
+```{r construct-check}
+check_example <- 400 * log(101 / 100)
+cpi_q1_1960 <- stage1$value[stage1$qtr == stage1_start]
+cpi_q4_1959 <- cpi_all$value[cpi_all$qtr == zoo::as.yearqtr("1959 Q4")]
+pi_q1_1960 <- stage1$infl[stage1$qtr == stage1_start]
+```
+
+In R, $400\log(101/100)$ equals `r round(check_example, 2)`. For the data, 1959Q4 CPI is `r round(cpi_q4_1959, 3)` and 1960Q1 CPI is `r round(cpi_q1_1960, 3)`, so $\pi_{1960Q1}$ is `r round(pi_q1_1960, 2)` percent.
+
+The later windows in the project (2000Q1-2019Q4 for historical forecast comparison, and 2020Q1 through the latest common quarter for final evaluation) remain in the downloaded files. I do not use them in Stage 1.
+
+# Step 4: Exploratory analysis, 1960Q1-1999Q4
+
+```{r stage1-stats}
+stage1 <- stage1 %>%
+  mutate(
+    date = as.Date(qtr),
+    trail_mean = trailing_stat(infl, 20, mean),
+    trail_sd = trailing_stat(infl, 20, sd)
+  )
+
+summ <- stage1 %>%
+  summarise(
+    mean_pi = mean(infl, na.rm = TRUE),
+    sd_pi = sd(infl, na.rm = TRUE),
+    min_pi = min(infl, na.rm = TRUE),
+    max_pi = max(infl, na.rm = TRUE),
+    min_q = qtr[which.min(infl)],
+    max_q = qtr[which.max(infl)]
+  )
+```
+
+In this window the sample mean of inflation is `r round(summ$mean_pi, 2)` percent (annualized) and the standard deviation is `r round(summ$sd_pi, 2)`. The lowest quarter is `r round(summ$min_pi, 2)` percent in `r summ$min_q`. The highest is `r round(summ$max_pi, 2)` percent in `r summ$max_q`.
+
+## CPI and inflation
+
+```{r fig-cpi-infl, fig.height=5.6}
+p_cpi <- ggplot(stage1, aes(date, value)) +
+  geom_line(linewidth = 0.6) +
+  labs(title = "End-of-quarter headline CPI", x = NULL, y = "Index (1982-84 = 100)") +
+  theme_bw()
+
+p_inf <- ggplot(stage1, aes(date, infl)) +
+  geom_hline(yintercept = 0, linewidth = 0.3) +
+  geom_line(linewidth = 0.6) +
+  labs(title = "Annualized quarter-over-quarter CPI inflation", x = "Quarter", y = "Percent") +
+  theme_bw()
+
+p_cpi / p_inf
+```
+
+The CPI level moves up through almost the whole sample. That is what a price *index* does when prices seldom fall for an entire quarter: each quarter's $P_t$ is usually larger than $P_{t-1}$, so the series drifts higher. Inflation is the growth rate of that index, not the index itself. The growth rate can rise, fall, or dip below zero even while the level keeps climbing.
+
+The inflation panel is much less smooth. Inflation is relatively low in the early 1960s, then high and jumpy in the 1970s, then drops in the early 1980s and stays lower in the 1990s. Those are the unusual stretches that matter for later modeling: the typical level of inflation is not the same at the beginning of the sample as it is at the end.
+
+## Changing center and variability
+
+The trailing mean and trailing standard deviation at date $t$ use quarter $t$ and the 19 earlier quarters. No future observation enters the calculation. The first 19 quarters have no trailing statistic because the window is not yet full.
+
+```{r fig-trail, fig.height=5.6}
+p_mean <- ggplot(stage1, aes(date)) +
+  geom_line(aes(y = infl), linewidth = 0.35, alpha = 0.55) +
+  geom_line(aes(y = trail_mean), linewidth = 0.8) +
+  labs(
+    title = "Inflation and trailing 20-quarter mean",
+    x = NULL, y = "Percent"
+  ) +
+  theme_bw()
+
+p_sd <- ggplot(stage1 %>% filter(!is.na(trail_sd)), aes(date, trail_sd)) +
+  geom_line(linewidth = 0.8) +
+  labs(
+    title = "Trailing 20-quarter standard deviation",
+    x = "Quarter", y = "Percent"
+  ) +
+  theme_bw()
+
+p_mean / p_sd
+```
+
+The trailing mean starts low, climbs through the 1970s, and then comes down through the 1980s and 1990s. The trailing standard deviation is also larger around the mid-1970s and the early 1980s than in the 1960s or the late 1990s. Both the center and the variability of inflation change. A single sample mean would sit somewhere in the middle and would be a poor description of either the early or the late part of the window.
+
+## Dependence
+
+```{r fig-acf, fig.height=4.2}
+acf_obj <- acf(stage1$infl, lag.max = 16, plot = FALSE)
+pacf_obj <- pacf(stage1$infl, lag.max = 16, plot = FALSE)
+acf_df <- tibble(lag = as.numeric(acf_obj$lag), acf = as.numeric(acf_obj$acf), type = "ACF")
+pacf_df <- tibble(lag = as.numeric(pacf_obj$lag), acf = as.numeric(pacf_obj$acf), type = "PACF")
+band <- 1.96 / sqrt(nrow(stage1))
+dep <- bind_rows(acf_df, pacf_df) %>% filter(lag > 0)
+
+ggplot(dep, aes(lag, acf)) +
+  geom_hline(yintercept = 0, linewidth = 0.3) +
+  geom_hline(yintercept = c(-band, band), linetype = 2, linewidth = 0.3) +
+  geom_col(width = 0.35) +
+  facet_wrap(~type, ncol = 2) +
+  scale_x_continuous(breaks = 1:16) +
+  labs(
+    title = "ACF and PACF of CPI inflation, 1960Q1-1999Q4",
+    x = "Lag (quarters)", y = "Correlation"
+  ) +
+  theme_bw()
+```
+
+```{r dep-text}
+acf1 <- acf_obj$acf[2]
+pacf1 <- pacf_obj$acf[1]
+acf_vals <- as.numeric(acf_obj$acf[-1])
+pacf_vals <- as.numeric(pacf_obj$acf)
+acf_sig <- which(abs(acf_vals) > band)
+pacf_sig <- which(abs(pacf_vals) > band)
+```
+
+The strongest relationship is at lag 1: the sample ACF is `r round(acf1, 2)` and the PACF is `r round(pacf1, 2)`. Using the usual $\pm 1.96/\sqrt{n}$ bands, the ACF stays outside the band at lags `r paste(acf_sig, collapse = ", ")`. The PACF is outside the band at lags `r paste(pacf_sig, collapse = ", ")`.
+
+Dependence is not weak, and it is not confined to lag 1. Nearby quarters move together, and the ACF fades slowly. That is the pattern I would expect if inflation has both short-run AR dynamics and a mean that drifts. I will treat this as a description of the sample, not as a finished model.
+
+## Potential predictors
+
+```{r fig-predictors, fig.height=7.2}
+p_u <- ggplot(stage1, aes(date, unrate)) +
+  geom_line(linewidth = 0.6) +
+  labs(title = "Civilian unemployment rate, end of quarter", x = NULL, y = "Percent") +
+  theme_bw()
+
+p_r <- ggplot(stage1, aes(date, tb3ms)) +
+  geom_line(linewidth = 0.6) +
+  labs(title = "3-month Treasury bill rate, end of quarter", x = NULL, y = "Percent") +
+  theme_bw()
+
+p_sc <- ggplot(stage1, aes(unrate, infl)) +
+  geom_point(alpha = 0.55, size = 1.6) +
+  labs(
+    title = "Inflation against unemployment (descriptive plot)",
+    x = "Unemployment rate (percent)", y = "Inflation (percent)"
+  ) +
+  theme_bw()
+
+p_u / p_r / p_sc
+```
+
+Unemployment rises in the usual recession years, including the mid-1970s and the early 1980s. The bill rate is low early in the sample, high in the late 1970s and early 1980s, and lower again by the 1990s. Those movements line up loosely with the inflation history, which is why both series are candidates for later models.
+
+The scatter is only a description of how the two series sit together in 1960Q1-1999Q4. It is not a causal Phillips curve. In this sample, several high-inflation quarters also have high unemployment (the 1970s stagflation years), so the cloud does not show a clean downward slope. Whether unemployment helps *forecast* inflation is a later question. I do not read that off this plot.
+
+# Step 5: Changes in the inflation mean
+
+I apply a PELT change-point analysis to the mean of CPI inflation over 1960Q1-1999Q4, with a BIC penalty.
+
+```{r pelt}
+cpt_mean <- cpt.mean(stage1$infl, method = "PELT", penalty = "BIC")
+seg <- segment_table(stage1, cpt_mean)
+stage1$seg_mean <- NA_real_
+for (i in seq_len(nrow(seg))) {
+  idx <- which(as.character(stage1$qtr) >= seg$start_quarter[i] &
+                 as.character(stage1$qtr) <= seg$end_quarter[i])
+  stage1$seg_mean[idx] <- seg$mean_inflation[i]
+}
+
+knitr::kable(
+  seg %>% mutate(mean_inflation = round(mean_inflation, 2)),
+  caption = "PELT (BIC) mean segments for CPI inflation, 1960Q1-1999Q4.",
+  col.names = c("Segment", "Start quarter", "End quarter", "Mean inflation (%)"),
+  booktabs = TRUE
+)
+```
+
+```{r fig-pelt, fig.height=3.8}
+ggplot(stage1, aes(date)) +
+  geom_line(aes(y = infl), linewidth = 0.45, alpha = 0.7) +
+  geom_line(aes(y = seg_mean), linewidth = 0.9) +
+  labs(
+    title = "Inflation with PELT/BIC piecewise means",
+    x = "Quarter", y = "Percent"
+  ) +
+  theme_bw()
+```
+
+The estimated change dates (the first quarter of each new segment) are `r paste(seg$start_quarter[-1], collapse = ", ")`. The table reports each segment's start quarter, end quarter, and mean inflation rate. The plot shows those piecewise means on top of the inflation series.
+
+The PELT segments match the trailing-mean figure in broad terms: a lower mean early on, a higher mean in the inflation years of the 1970s, and a lower mean after disinflation. The trailing mean moves continuously; PELT draws fewer, sharper steps. Both pictures say the same thing about the assignment question. One constant historical mean does not describe 1960Q1-1999Q4 well.
+
+# Reference
+
+Faust, J., and Wright, J. H. (2013). "Forecasting Inflation." In *Handbook of Economic Forecasting*, Volume 2A.
