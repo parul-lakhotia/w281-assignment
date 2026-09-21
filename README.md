@@ -1,10 +1,10 @@
 # w281-assignment
 
-Personal copy of [W281](https://github.com/W281) course materials. The org repos cannot be forked, so the official assignment starters live here under `clones/`.
+Personal copy of MIDS W281 (Computer Vision) materials. The official org repos cannot be forked, so the starter code is copied here.
 
 ## Layout
 
-- `clones/Assignment-1-repo` … `Assignment-7-repo`: unmodified copies of the course assignment repos
-- `solutions/`: working copies and answers (Assignments 1 and 2 in progress)
+- `official/Assignment-N-repo` unmodified clones of [W281](https://github.com/W281) assignment starters
+- `solutions/assignment1` and `solutions/assignment2` completed notebooks plus the original images
 
-Remote: https://github.com/parul-lakhotia/w281-assignment
+Inflation forecasting is a different course (W271) and is not in this repo.
